@@ -1,20 +1,76 @@
 ﻿using DirectumTest.Models;
 using OfficeOpenXml;
+using System;
+using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading.Channels;
 using System.Xml.Serialization;
 
 namespace DirectumTest
 {
     internal class Program
     {
-        const string folder_path = "C:\\Users\\JackJkee\\Desktop\\Directum Тестовое Задание";
-        const string excelFilePath = $"{folder_path}\\DirectumTest.xlsx";
+        static readonly string currentDir = AppDomain.CurrentDomain.BaseDirectory;
+        const string filesFolderName = "Directum Files";
+        static readonly string filesPath = $"{currentDir}\\{filesFolderName}";
+        const string GetLastDownloadFileInfoURL = "http://fias.nalog.ru/WebServices/Public/GetLastDownloadFileInfo";
+        static readonly string excelFilePath = $"{currentDir}\\DirectumTest.xlsx";
+
+        static List<AddressObjects.AObject> objects = new();
+        static List<ObjectLevels.ObjectLevel> levels = new();
 
         static int[] LEVEL_SIFT = [9, 10, 17];
 
-        
+        static async Task Main(string[] args)
+        {
+            #region Инициализация
+            Initialize();
+            ClearDirectory(filesPath);
 
-        static void Main(string[] args)
+            DownloadFileInfo? dwi = await GetDownloadFileInfoAsync(GetLastDownloadFileInfoURL);
+
+            if (dwi == null)
+            {
+                Console.WriteLine("Ошибка при загрузке информации DownloadFileInfo");
+                return;
+            }
+            #endregion
+
+            #region скачивание архива
+
+            Console.WriteLine("Скачивание архива...");
+
+            Uri uri = new Uri(dwi.GarXMLDeltaUrl);
+            string zipName = Path.GetFileName(uri.LocalPath);
+
+            if (! await DownloadFile(dwi.GarXMLDeltaUrl, $"{filesPath}\\{zipName}"))
+                return;
+
+            Console.WriteLine("Скачивание архива завершено.");
+            #endregion
+
+            #region Распаковка архива
+            Console.WriteLine("Расспаковка архива...");
+            System.IO.Compression.ZipFile.ExtractToDirectory($"{filesPath}\\{zipName}", filesPath);
+            Console.WriteLine("Расспаковка архива завершена.");
+            #endregion
+
+            #region Загрузка объектов и уровней
+            Console.WriteLine("Загрузка объектов...");
+            LoadObjects(ref objects);
+
+            Console.WriteLine("Загрузка уровней...");
+            LoadLevels(ref levels);
+            #endregion
+
+            #region Генерация отчета
+            Console.WriteLine("Генерация отчета...");
+            GenerateReport(ref objects, ref levels, dwi);
+            Console.WriteLine("Генерация отчета завершена.");
+            #endregion
+        }
+
+        static void GenerateReport(ref List<AddressObjects.AObject> objects, ref List<ObjectLevels.ObjectLevel> levels, DownloadFileInfo dwi)
         {
             if (File.Exists(excelFilePath))
                 File.Delete(excelFilePath);
@@ -23,83 +79,53 @@ namespace DirectumTest
             var excelFile = new FileInfo(excelFilePath);
             using ExcelPackage package = new ExcelPackage(excelFile);
 
-            List<AddressObjects.AObject> objects = new();
-            List<ObjectLevels.ObjectLevel> levels = new();
+            int row = 1;
 
-            Console.WriteLine("______________ Загрузка объектов ______________");
-            LoadObjects(ref objects);
+            var ws = package.Workbook.Worksheets.Add(dwi.Date);
+            ws.Cells[1, 1].Value = $"Отчет по добавленным адресным объектам за {dwi.Date}";
 
-            Console.WriteLine("______________ Загрузка уровней _______________");
-            LoadLevels(ref levels);
+            var listLevels = objects
+                .Select(o => o.Level)
+                .Distinct()
+                .ToList();
 
-
-            var sortedObjects = objects.OrderBy(o => o.UpdateDate).ToList();
-            var listDates = sortedObjects.Select(o => o.UpdateDate).Distinct().ToList();
-            
-
-            foreach (var date in listDates)
+            foreach (var level in listLevels)
             {
-                Console.WriteLine($"Дата: {date}");
+                var levelName = levels.Find(lvl => lvl.Level == level).Name;
 
-                string dateWithoutTime = date.Date.ToString("dd/MM/yyyy");
-                int field = 1, row = 1;
-
-                var ws = package.Workbook.Worksheets.Add(dateWithoutTime);
-                
-
-                var range = ws.Cells[1, 1].Value = $"Отчет по добавленным адресным объектам за {dateWithoutTime}";
-
-                var listLevels = sortedObjects
-                    .Where(o => o.UpdateDate == date)
-                    .Select(o => o.Level)
-                    .Distinct()
+                var tmpObjects = objects
+                    .Where(o => o.Level == level)
+                    .Where(o => o.IsActive == true)
+                    .OrderBy(o => o.Name)
                     .ToList();
 
-                foreach(var level in listLevels)
+                if (tmpObjects.Count == 0) continue;
+
+                ws.Cells[++row, 1].Value = levelName;
+                ws.Cells[++row, 1].Value = "Тип объекта";
+                ws.Cells[row++, 2].Value = "Наименование";
+
+                foreach (var o in tmpObjects)
                 {
-                    var levelName = levels.Find(lvl => lvl.Level == level).Name;
+                    if (!o.IsActive || LEVEL_SIFT.Contains(o.Level))
+                        continue;
 
-                    var tmpObjects = sortedObjects
-                        .Where(o => o.UpdateDate == date)
-                        .Where(o => o.Level == level)
-                        .Where(o => o.IsActive == true)
-                        .OrderBy(o => o.Name)
-                        .ToList();
+                    ws.Cells[row, 1].Value = o.TypeName;
+                    ws.Cells[row, 2].Value = o.Name;
 
-                    if(tmpObjects.Count == 0) continue;
+                    row++;
 
-                    ws.Cells[++row, 1].Value = levelName;
-                    ws.Cells[++row, 1].Value = "Тип объекта";
-                    ws.Cells[row++, 2].Value = "Наименование";
-
-                    foreach (var o in tmpObjects)
-                    {
-                        if (!o.IsActive || LEVEL_SIFT.Contains(o.Level))
-                            continue;
-
-                        ws.Cells[row, 1].Value = o.TypeName;
-                        ws.Cells[row, 2].Value = o.Name;
-
-                        row++;
-
-                        Console.WriteLine($"{o.Name} | {o.UpdateDate} | Level: {levelName} ({level})");
-
-                    }
-                    Console.WriteLine();
                 }
-                ws.Column(1).AutoFit();
-                ws.Column(2).AutoFit();
             }
-
-            
+            ws.Column(1).AutoFit();
+            ws.Column(2).AutoFit();
             package.Save();
-
         }
 
         static void LoadLevels(ref List<ObjectLevels.ObjectLevel> levels)
         {
             XmlSerializer serializer = new XmlSerializer(typeof(ObjectLevels));
-            var files = Directory.GetFiles(folder_path, "*.xml");
+            var files = Directory.GetFiles(filesPath, "*.xml");
 
             foreach (var file in files)
             {                
@@ -117,7 +143,6 @@ namespace DirectumTest
                     foreach(var level in obj.objectLevels)
                     {
                         levels.Add(level);
-                        //Console.WriteLine(level.Name);
                     }
 
                 }
@@ -127,7 +152,7 @@ namespace DirectumTest
         static void LoadObjects(ref List<AddressObjects.AObject> listObjects)
         {
             XmlSerializer serializer = new XmlSerializer(typeof(Models.AddressObjects));
-            var dirs = Directory.GetDirectories(folder_path);
+            var dirs = Directory.GetDirectories(filesPath);
 
             foreach (var dir in dirs)
             {
@@ -156,5 +181,76 @@ namespace DirectumTest
 
             }
         }
+
+        public static void ClearDirectory(string path)
+        {
+            DirectoryInfo di = new DirectoryInfo(path);
+
+            Array.ForEach(Directory.GetFiles(path), File.Delete);
+
+            foreach (DirectoryInfo dir in di.GetDirectories())
+            {
+                foreach (FileInfo file in dir.GetFiles())
+                {
+                    file.Delete();
+                }
+                dir.Delete(true);
+            }
+        }
+
+        public static void Initialize()
+        {
+            if (!Directory.Exists(filesPath))
+                Directory.CreateDirectory(filesPath);
+        }
+
+        public static async Task<string?> GetJsonFromUrlAsync(string url)
+        {
+            try
+            {
+                using HttpClient client = new HttpClient();
+                var response = await client.GetAsync(url);
+
+                if (response.StatusCode != System.Net.HttpStatusCode.OK)
+                    throw new Exception($"Ошибка соединения с сервисом. Status Code: {response.StatusCode}");
+
+                return await response.Content.ReadAsStringAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+                return null;
+            }
+        }
+
+        public static async Task<DownloadFileInfo?> GetDownloadFileInfoAsync(string url)
+        {
+            string? json = await GetJsonFromUrlAsync(url);
+
+            if (json == null) return null;
+
+            return JsonSerializer.Deserialize<DownloadFileInfo>(json);
+        }
+
+        public static async Task<bool> DownloadFile(string url, string path)
+        {
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+
+                using HttpClient client = new();
+                using Stream stream = await client.GetStreamAsync(url);
+                using FileStream fs = new(path, FileMode.Create);
+                await stream.CopyToAsync(fs);
+                return true;
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+                return false;
+            }
+        }
+
     }
 }
